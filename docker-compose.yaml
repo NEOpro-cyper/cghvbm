@@ -1,8 +1,9 @@
 services:
-  app:
-    build: .
-    ports:
-      - "3050:3000"
-    environment:
-      - PORT=3000
+  lordflix-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
     restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    # network_mode: host
