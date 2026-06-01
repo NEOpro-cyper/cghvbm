@@ -1,0 +1,17 @@
+{
+  "name": "lordflix-api",
+  "version": "1.0.0",
+  "description": "LordFlix Stream Extractor — JSON API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "install-browsers": "npx playwright install chromium --with-deps"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "playwright": "^1.49.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
