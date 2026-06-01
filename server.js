@@ -202,6 +202,8 @@ async function extractStreams({ type, tmdbId, season, episode, watchUrl }) {
   };
 }
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`LordFlix API running on http://0.0.0.0:${PORT}`);
+const HOSTNAME = process.env.HOSTNAME || "0.0.0.0";
+
+app.listen(PORT, HOSTNAME, () => {
+  console.log(`LordFlix API running on http://${HOSTNAME}:${PORT}`);
 });
