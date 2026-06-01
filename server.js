@@ -23,17 +23,43 @@ app.get("/", (_req, res) => {
     service: "LordFlix Stream Extractor API",
     version: "1.0.0",
     endpoints: {
-      extract: "POST /api/extract",
       health: "GET /",
+      movie: "GET /movie/:tmdbId",
+      tv: "GET /tv/:tmdbId/:season/:episode",
+      extractPost: "POST /api/extract",
     },
     usage: {
-      movie: 'POST /api/extract  body: { "type":"movie", "tmdbId":"1216578" }',
-      tv: 'POST /api/extract  body: { "type":"tv", "tmdbId":"220102", "season":"1", "episode":"1" }',
+      movie: "GET /movie/1216578",
+      tv: "GET /tv/220102/1/1",
+      post: 'POST /api/extract  body: { "type":"tv", "tmdbId":"220102", "season":"1", "episode":"1" }',
     },
   });
 });
 
-// ─── Extract endpoint ────────────────────────────────────────────────────────
+// ─── GET endpoints (URL path based) ─────────────────────────────────────────
+app.get("/movie/:tmdbId", async (req, res) => {
+  const tmdbId = req.params.tmdbId;
+  const watchUrl = `${BASE_URL}/watch/movie/${tmdbId}`;
+  try {
+    const result = await extractStreams({ type: "movie", tmdbId, watchUrl });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/tv/:tmdbId/:season/:episode", async (req, res) => {
+  const { tmdbId, season, episode } = req.params;
+  const watchUrl = `${BASE_URL}/watch/tv/${tmdbId}/${season}/${episode}`;
+  try {
+    const result = await extractStreams({ type: "tv", tmdbId, season, episode, watchUrl });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── POST endpoint (JSON body) ─────────────────────────────────────────────
 app.post("/api/extract", async (req, res) => {
   const { type, tmdbId, season, episode } = req.body;
 
