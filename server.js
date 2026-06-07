@@ -106,16 +106,8 @@ async function getMeta(tmdbId, type, season, episode) {
   }
 }
 
-// Core extraction using enc-dec.app
-async function extractStreams({ type, tmdbId, season, episode, server }) {
-  // 1. Get servers and metadata in parallel
-  const [servers, meta] = await Promise.all([
-    getServers(),
-    getMeta(tmdbId, type, season, episode),
-  ]);
-  const selectedServer = server || servers[0] || "Berlin";
-
-  // 3. Build snowhouse URL
+// Try a single server — returns result or null
+async function tryServer({ type, tmdbId, season, episode, serverName, meta }) {
   const typeParam = type === "movie" ? "movie" : "series";
   const params = new URLSearchParams({
     title: meta.title || "",
@@ -123,7 +115,7 @@ async function extractStreams({ type, tmdbId, season, episode, server }) {
     year: meta.year || "",
     imdb: meta.imdbId || "",
     tmdb: tmdbId,
-    server: selectedServer,
+    server: serverName,
   });
   if (type === "tv") {
     params.set("season", season);
@@ -131,37 +123,81 @@ async function extractStreams({ type, tmdbId, season, episode, server }) {
   }
   const snowhouseUrl = `${SNOWHOUSE}/?${params.toString()}`;
 
-  // 4. Encrypt via enc-dec.app
+  // 1. Encrypt via enc-dec.app
   const encRes = await fetchJSON(`${ENC_DEC_API}/enc-lordflix?url=${encodeURIComponent(snowhouseUrl)}`);
-  if (encRes.status !== 200) {
-    throw new Error(encRes.error || "Encryption failed");
-  }
+  if (encRes.status !== 200) return null;
 
   const encUrl = encRes.result?.url;
   const sign = encRes.result?.sign;
-  if (!encUrl || !sign) {
-    throw new Error("Encryption returned no URL or sign");
-  }
+  if (!encUrl || !sign) return null;
 
-  // 5. Fetch encrypted data
-  const encrypted = await fetchText(encUrl, 30000);
+  // 2. Fetch encrypted data
+  const encrypted = await fetchText(encUrl, 15000);
 
-  // 6. Decrypt via enc-dec.app
+  // 3. Decrypt via enc-dec.app
   const decRes = await fetch(`${ENC_DEC_API}/dec-lordflix`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text: encrypted, sign }),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(15000),
   });
   const decData = await decRes.json();
-  if (decRes.status !== 200 || decData.status !== 200) {
-    throw new Error(decData.error || "Decryption failed");
-  }
+  if (decRes.status !== 200 || decData.status !== 200) return null;
 
   const decrypted = decData.result;
 
-  // 7. Parse decrypted data — extract stream info
-  return parseDecrypted(decrypted, { type, tmdbId, season, episode, selectedServer, servers, meta });
+  // 4. Check if decrypted response is an error
+  if (typeof decrypted === "object" && decrypted?.error) return null;
+
+  return decrypted;
+}
+
+// Core extraction — tries servers with auto-fallback
+async function extractStreams({ type, tmdbId, season, episode, server }) {
+  // 1. Get servers and metadata in parallel
+  const [servers, meta] = await Promise.all([
+    getServers(),
+    getMeta(tmdbId, type, season, episode),
+  ]);
+
+  // 2. Build server order: requested server first, then the rest
+  let serverOrder = [];
+  if (server) {
+    serverOrder.push(server);
+    servers.forEach((s) => { if (s !== server) serverOrder.push(s); });
+  } else {
+    serverOrder = [...servers];
+  }
+  if (serverOrder.length === 0) serverOrder.push("Berlin");
+
+  // 3. Try each server until one works
+  let lastError = null;
+  for (const serverName of serverOrder) {
+    try {
+      const decrypted = await tryServer({ type, tmdbId, season, episode, serverName, meta });
+      if (decrypted !== null) {
+        return parseDecrypted(decrypted, { type, tmdbId, season, episode, selectedServer: serverName, servers, meta });
+      }
+    } catch (err) {
+      lastError = err.message;
+    }
+  }
+
+  // All servers failed
+  return {
+    title: meta?.title || null,
+    type, tmdbId,
+    season: season || null, episode: episode || null,
+    watchUrl: type === "movie"
+      ? `${BASE_URL}/watch/movie/${tmdbId}`
+      : `${BASE_URL}/watch/tv/${tmdbId}/${season}/${episode}`,
+    selectedServer: null,
+    masterM3u8: null, streams: [], subtitles: [],
+    servers,
+    decrypted: null,
+    timestamp: new Date().toISOString(),
+    error: lastError || "All servers failed",
+  };
 }
 
 function parseDecrypted(decrypted, info) {
@@ -277,8 +313,9 @@ function parseM3U8(m3u8, result) {
 // ─── GET endpoints (URL path based) ─────────────────────────────────────────
 app.get("/movie/:tmdbId", async (req, res) => {
   const tmdbId = req.params.tmdbId;
+  const server = req.query.server || null;
   try {
-    const result = await extractStreams({ type: "movie", tmdbId });
+    const result = await extractStreams({ type: "movie", tmdbId, server });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -287,8 +324,9 @@ app.get("/movie/:tmdbId", async (req, res) => {
 
 app.get("/tv/:tmdbId/:season/:episode", async (req, res) => {
   const { tmdbId, season, episode } = req.params;
+  const server = req.query.server || null;
   try {
-    const result = await extractStreams({ type: "tv", tmdbId, season, episode });
+    const result = await extractStreams({ type: "tv", tmdbId, season, episode, server });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
