@@ -1,12 +1,21 @@
 const express = require("express");
-const { chromium } = require("playwright");
-const path = require("path");
+const { JSDOM } = require("jsdom");
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
+const HOSTNAME = process.env.HOSTNAME || "0.0.0.0";
 const BASE_URL = "https://lordflix.org";
+const SNOWHOUSE = "https://snowhouse.lordflix.club";
+const ENC_DEC_API = "https://enc-dec.app/api";
+
+const HEADERS = {
+  "Accept": "*/*",
+  "Origin": "https://lordflix.org",
+  "Referer": "https://lordflix.org/",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+};
 
 // ─── CORS ───────────────────────────────────────────────────────────────────
 app.use((_, res, next) => {
@@ -21,7 +30,8 @@ app.use((_, res, next) => {
 app.get("/", (_req, res) => {
   res.json({
     service: "LordFlix Stream Extractor API",
-    version: "1.0.0",
+    version: "2.0.0",
+    engine: "enc-dec.app (no browser needed)",
     endpoints: {
       health: "GET /",
       movie: "GET /movie/:tmdbId",
@@ -36,12 +46,239 @@ app.get("/", (_req, res) => {
   });
 });
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async function fetchJSON(url) {
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15000) });
+  return res.json();
+}
+
+async function fetchText(url) {
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15000) });
+  return res.text();
+}
+
+async function getServers() {
+  try {
+    const data = await fetchJSON(`${SNOWHOUSE}/servers`);
+    const servers = Array.isArray(data) ? data : data.servers || [];
+    return servers.map((s) => s.name);
+  } catch {
+    return [];
+  }
+}
+
+// Scrape title, year, imdb_id from LordFlix page
+async function getMeta(tmdbId, type, season, episode) {
+  const url = type === "movie"
+    ? `${BASE_URL}/watch/movie/${tmdbId}`
+    : `${BASE_URL}/watch/tv/${tmdbId}/${season}/${episode}`;
+
+  try {
+    const html = await fetchText(url);
+    const dom = new JSDOM(html);
+    const doc = dom.window.document;
+
+    // Try JSON-LD first
+    const jsonLd = doc.querySelectorAll('script[type="application/ld+json"]');
+    for (const el of jsonLd) {
+      try {
+        const parsed = JSON.parse(el.textContent);
+        const movie = parsed["@type"] === "Movie" ? parsed :
+                      Array.isArray(parsed) ? parsed.find((e) => e["@type"] === "Movie") : null;
+        if (movie) {
+          return {
+            title: movie.name || doc.title || "",
+            year: (movie.datePublished || "").substring(0, 4),
+            imdbId: (movie.url || "").match(/tt\d+/)?.[0] || "",
+          };
+        }
+      } catch {}
+    }
+
+    // Fallback: parse from og:title or page title
+    const ogTitle = doc.querySelector('meta[property="og:title"]')?.content || "";
+    const title = ogTitle || doc.title || "";
+    const yearMatch = title.match(/\((\d{4})\)/);
+    return { title, year: yearMatch?.[1] || "", imdbId: "" };
+  } catch {
+    return { title: "", year: "", imdbId: "" };
+  }
+}
+
+// Core extraction using enc-dec.app
+async function extractStreams({ type, tmdbId, season, episode, server }) {
+  // 1. Get servers
+  const servers = await getServers();
+  const selectedServer = server || servers[0] || "Berlin";
+
+  // 2. Get metadata from LordFlix page
+  const meta = await getMeta(tmdbId, type, season, episode);
+
+  // 3. Build snowhouse URL
+  const typeParam = type === "movie" ? "movie" : "series";
+  const params = new URLSearchParams({
+    title: meta.title || "",
+    type: typeParam,
+    year: meta.year || "",
+    imdb: meta.imdbId || "",
+    tmdb: tmdbId,
+    server: selectedServer,
+  });
+  if (type === "tv") {
+    params.set("season", season);
+    params.set("episode", episode);
+  }
+  const snowhouseUrl = `${SNOWHOUSE}/?${params.toString()}`;
+
+  // 4. Encrypt via enc-dec.app
+  const encRes = await fetchJSON(`${ENC_DEC_API}/enc-lordflix?url=${encodeURIComponent(snowhouseUrl)}`);
+  if (encRes.status !== 200) {
+    throw new Error(encRes.error || "Encryption failed");
+  }
+
+  const encUrl = encRes.result?.url;
+  const sign = encRes.result?.sign;
+  if (!encUrl || !sign) {
+    throw new Error("Encryption returned no URL or sign");
+  }
+
+  // 5. Fetch encrypted data
+  const encrypted = await fetchText(encUrl);
+
+  // 6. Decrypt via enc-dec.app
+  const decRes = await fetch(`${ENC_DEC_API}/dec-lordflix`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: encrypted, sign }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const decData = await decRes.json();
+  if (decRes.status !== 200 || decData.status !== 200) {
+    throw new Error(decData.error || "Decryption failed");
+  }
+
+  const decrypted = decData.result;
+
+  // 7. Parse decrypted data — extract stream info
+  return parseDecrypted(decrypted, { type, tmdbId, season, episode, selectedServer, servers, meta });
+}
+
+function parseDecrypted(decrypted, info) {
+  const result = {
+    title: info.meta?.title || null,
+    type: info.type,
+    tmdbId: info.tmdbId,
+    season: info.season || null,
+    episode: info.episode || null,
+    watchUrl: info.type === "movie"
+      ? `${BASE_URL}/watch/movie/${info.tmdbId}`
+      : `${BASE_URL}/watch/tv/${info.tmdbId}/${info.season}/${info.episode}`,
+    selectedServer: info.selectedServer,
+    masterM3u8: null,
+    streams: [],
+    subtitles: [],
+    servers: info.servers,
+    decrypted,
+    timestamp: new Date().toISOString(),
+    error: null,
+  };
+
+  // Parse M3U8 content if returned
+  if (typeof decrypted === "string") {
+    if (decrypted.includes("#EXTM3U")) {
+      return parseM3U8(decrypted, result);
+    }
+    // Try to parse as JSON
+    try {
+      const parsed = JSON.parse(decrypted);
+      if (parsed.url) result.masterM3u8 = parsed.url;
+      if (parsed.sources) {
+        result.streams = parsed.sources.map((s) => ({
+          quality: s.quality || s.label || "unknown",
+          url: s.url || s.file || "",
+        }));
+      }
+      if (parsed.tracks) {
+        result.subtitles = parsed.tracks
+          .filter((t) => t.kind === "captions" || t.kind === "subtitles")
+          .map((t) => ({ language: t.language || "unknown", label: t.label || "", url: t.url || "" }));
+      }
+    } catch {}
+  } else if (typeof decrypted === "object" && decrypted !== null) {
+    if (decrypted.url) result.masterM3u8 = decrypted.url;
+    if (decrypted.sources) {
+      result.streams = decrypted.sources.map((s) => ({
+        quality: s.quality || s.label || "unknown",
+        url: s.url || s.file || "",
+      }));
+    }
+  }
+
+  return result;
+}
+
+function parseM3U8(m3u8, result) {
+  const lines = m3u8.split("\n").map((l) => l.trim()).filter(Boolean);
+
+  // Find master playlist streams
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    if (line.startsWith("#EXT-X-STREAM-INF:")) {
+      const qualityMatch = line.match(/RESOLUTION=\d+x(\d+)/);
+      const bandwidthMatch = line.match(/BANDWIDTH=(\d+)/);
+      const nameMatch = line.match(/NAME="([^"]+)"/);
+      const nextLine = lines[i + 1];
+
+      if (nextLine && !nextLine.startsWith("#")) {
+        let quality = "unknown";
+        if (qualityMatch) {
+          const height = parseInt(qualityMatch[1]);
+          quality = `${Math.round(height / 2) * 2}p`; // round to nearest
+        }
+        if (nameMatch) quality = nameMatch[1];
+
+        result.streams.push({ quality, url: nextLine });
+
+        if (!result.masterM3u8) {
+          // The URL that returned this m3u8 IS the master
+          result.masterM3u8 = result.streams[0].url.split("/").slice(0, -1).join("/") || null;
+        }
+      }
+    }
+
+    if (line.startsWith("#EXT-X-MEDIA:TYPE=SUBTITLES")) {
+      const langMatch = line.match(/LANGUAGE="([^"]+)"/);
+      const nameMatch = line.match(/NAME="([^"]+)"/);
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      if (uriMatch) {
+        result.subtitles.push({
+          language: langMatch?.[1] || "unknown",
+          label: nameMatch?.[1] || "",
+          url: uriMatch[1],
+        });
+      }
+    }
+  }
+
+  // If no quality streams parsed but have m3u8 content, store as master
+  if (result.streams.length === 0 && result.subtitles.length === 0) {
+    // It might be a quality playlist itself
+    const urls = lines.filter((l) => l.startsWith("http"));
+    if (urls.length > 0) {
+      result.streams.push({ quality: "unknown", url: urls[0] });
+    }
+  }
+
+  return result;
+}
+
 // ─── GET endpoints (URL path based) ─────────────────────────────────────────
 app.get("/movie/:tmdbId", async (req, res) => {
   const tmdbId = req.params.tmdbId;
-  const watchUrl = `${BASE_URL}/watch/movie/${tmdbId}`;
   try {
-    const result = await extractStreams({ type: "movie", tmdbId, watchUrl });
+    const result = await extractStreams({ type: "movie", tmdbId });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -50,9 +287,8 @@ app.get("/movie/:tmdbId", async (req, res) => {
 
 app.get("/tv/:tmdbId/:season/:episode", async (req, res) => {
   const { tmdbId, season, episode } = req.params;
-  const watchUrl = `${BASE_URL}/watch/tv/${tmdbId}/${season}/${episode}`;
   try {
-    const result = await extractStreams({ type: "tv", tmdbId, season, episode, watchUrl });
+    const result = await extractStreams({ type: "tv", tmdbId, season, episode });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -61,7 +297,7 @@ app.get("/tv/:tmdbId/:season/:episode", async (req, res) => {
 
 // ─── POST endpoint (JSON body) ─────────────────────────────────────────────
 app.post("/api/extract", async (req, res) => {
-  const { type, tmdbId, season, episode } = req.body;
+  const { type, tmdbId, season, episode, server } = req.body;
 
   if (!type || !tmdbId) {
     return res.status(400).json({ error: "Missing required fields: type and tmdbId" });
@@ -73,137 +309,14 @@ app.post("/api/extract", async (req, res) => {
     return res.status(400).json({ error: "TV shows require season and episode" });
   }
 
-  const watchUrl = type === "movie"
-    ? `${BASE_URL}/watch/movie/${tmdbId}`
-    : `${BASE_URL}/watch/tv/${tmdbId}/${season}/${episode}`;
-
   try {
-    const result = await extractStreams({ type, tmdbId, season, episode, watchUrl });
+    const result = await extractStreams({ type, tmdbId, season, episode, server });
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── Core extractor ──────────────────────────────────────────────────────────
-async function extractStreams({ type, tmdbId, season, episode, watchUrl }) {
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-    ],
-  });
-
-  const context = await browser.newContext({
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    viewport: { width: 1920, height: 1080 },
-    ignoreHTTPSErrors: true,
-  });
-
-  const page = await context.newPage();
-
-  let masterM3u8 = null;
-  const qualityPlaylists = [];
-  let serverList = [];
-  let pageError = null;
-  let title = null;
-
-  // ── Network interceptor ──
-  await page.route("**/*", async (route) => {
-    const reqUrl = route.request().url();
-
-    // Capture server list
-    if (reqUrl.includes("snowhouse.lordflix.club/servers")) {
-      try {
-        const resp = await route.fetch();
-        const body = await resp.text();
-        const parsed = JSON.parse(body);
-        const servers = Array.isArray(parsed) ? parsed : parsed.servers || [];
-        serverList = servers.map((s) => s.name);
-        await route.fulfill({ response: resp });
-        return;
-      } catch {
-        await route.fallback();
-        return;
-      }
-    }
-
-    // Capture m3u8 playlists
-    if (reqUrl.includes(".m3u8") && !reqUrl.includes("_init") && !qualityPlaylists.some((q) => q.url === reqUrl)) {
-      const isQuality = reqUrl.includes("m3u8_proxy");
-      if (!isQuality) {
-        masterM3u8 = reqUrl;
-      } else {
-        const qualityMatch = reqUrl.match(/video_(\d+p)/);
-        const audioMatch = reqUrl.match(/audio_\d/);
-        const quality = qualityMatch ? qualityMatch[1] : audioMatch ? "audio" : "unknown";
-        qualityPlaylists.push({ url: reqUrl, quality });
-      }
-    }
-
-    await route.fallback();
-  });
-
-  // ── Navigate & wait ──
-  try {
-    await page.goto(watchUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-
-    // Wait for master m3u8 (up to 45s)
-    await new Promise((resolve) => {
-      const check = setInterval(() => {
-        if (masterM3u8) { clearInterval(check); resolve(true); }
-      }, 500);
-      setTimeout(() => { clearInterval(check); resolve(false); }, 45000);
-    });
-
-    if (!masterM3u8) {
-      await page.waitForTimeout(15000);
-    }
-
-    // Extra wait for quality playlists
-    await page.waitForTimeout(3000);
-
-    try { title = await page.title(); } catch {}
-  } catch (err) {
-    pageError = err.message;
-  }
-
-  // Parse subtitles from DOM
-  let subtitles = [];
-  try {
-    subtitles = await page.evaluate(() => {
-      return Array.from(document.querySelectorAll("video track")).map((t) => ({
-        language: t.getAttribute("srclang") || "unknown",
-        label: t.getAttribute("label") || "",
-        url: t.getAttribute("src") || "",
-      }));
-    });
-  } catch {}
-
-  await browser.close();
-
-  return {
-    title: title || null,
-    type,
-    tmdbId,
-    season: season || null,
-    episode: episode || null,
-    watchUrl,
-    masterM3u8: masterM3u8 || null,
-    streams: qualityPlaylists,
-    subtitles,
-    servers: serverList,
-    timestamp: new Date().toISOString(),
-    error: pageError || null,
-  };
-}
-
-const HOSTNAME = process.env.HOSTNAME || "0.0.0.0";
-
 app.listen(PORT, HOSTNAME, () => {
-  console.log(`LordFlix API running on http://${HOSTNAME}:${PORT}`);
+  console.log(`LordFlix API v2 running on http://${HOSTNAME}:${PORT}`);
 });
