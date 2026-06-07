@@ -48,13 +48,13 @@ app.get("/", (_req, res) => {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function fetchJSON(url) {
-  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15000) });
+async function fetchJSON(url, timeout = 30000) {
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(timeout) });
   return res.json();
 }
 
-async function fetchText(url) {
-  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(15000) });
+async function fetchText(url, timeout = 30000) {
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(timeout) });
   return res.text();
 }
 
@@ -75,7 +75,7 @@ async function getMeta(tmdbId, type, season, episode) {
     : `${BASE_URL}/watch/tv/${tmdbId}/${season}/${episode}`;
 
   try {
-    const html = await fetchText(url);
+    const html = await fetchText(url, 8000);
     const dom = new JSDOM(html);
     const doc = dom.window.document;
 
@@ -108,12 +108,12 @@ async function getMeta(tmdbId, type, season, episode) {
 
 // Core extraction using enc-dec.app
 async function extractStreams({ type, tmdbId, season, episode, server }) {
-  // 1. Get servers
-  const servers = await getServers();
+  // 1. Get servers and metadata in parallel
+  const [servers, meta] = await Promise.all([
+    getServers(),
+    getMeta(tmdbId, type, season, episode),
+  ]);
   const selectedServer = server || servers[0] || "Berlin";
-
-  // 2. Get metadata from LordFlix page
-  const meta = await getMeta(tmdbId, type, season, episode);
 
   // 3. Build snowhouse URL
   const typeParam = type === "movie" ? "movie" : "series";
@@ -144,14 +144,14 @@ async function extractStreams({ type, tmdbId, season, episode, server }) {
   }
 
   // 5. Fetch encrypted data
-  const encrypted = await fetchText(encUrl);
+  const encrypted = await fetchText(encUrl, 30000);
 
   // 6. Decrypt via enc-dec.app
   const decRes = await fetch(`${ENC_DEC_API}/dec-lordflix`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text: encrypted, sign }),
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(30000),
   });
   const decData = await decRes.json();
   if (decRes.status !== 200 || decData.status !== 200) {
